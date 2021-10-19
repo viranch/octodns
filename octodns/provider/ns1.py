@@ -452,11 +452,12 @@ class Ns1Provider(BaseProvider):
         super(Ns1Provider, self).__init__(id, *args, **kwargs)
         self.monitor_regions = monitor_regions
         self.shared_notifylist = shared_notifylist
+        self.record_filters = dict()
         self._client = Ns1Client(api_key, parallelism, retry_count,
                                  client_config)
 
-    def _valid_filter_config(self, filter_cfg, domain):
-        with_disabled = self._disabled_flag_in_filters(filter_cfg, domain)
+    def _valid_filter_config(self, filter_cfg):
+        with_disabled = self._disabled_flag_in_filters(filter_cfg)
         has_region = self._REGION_FILTER(with_disabled) in filter_cfg
         has_country = self._COUNTRY_FILTER(with_disabled) in filter_cfg
         expected_filter_cfg = self._get_updated_filter_chain(has_region,
@@ -697,11 +698,9 @@ class Ns1Provider(BaseProvider):
         return rules
 
     def _data_for_dynamic(self, _type, record):
-        # First make sure we have the expected filters config
-        if not self._valid_filter_config(record['filters'], record['domain']):
-            self.log.error('_data_for_dynamic: %s %s has unsupported '
-                           'filters', record['domain'], _type)
-            raise Ns1Exception('Unrecognized advanced record')
+        # Cache record filters for later use
+        record_filters = self.record_filters.setdefault(record['domain'], {})
+        record_filters[_type] = record['filters']
 
         default, pools = self._parse_pools(record['answers'])
         rules = self._parse_rules(pools, record['regions'])
@@ -771,13 +770,25 @@ class Ns1Provider(BaseProvider):
 
     def _data_for_CNAME(self, _type, record):
         if record.get('tier', 1) > 1:
-            # Advanced dynamic record
-            return self._data_for_dynamic(_type, record)
+            # Advanced record, see if it's first answer has a note
+            try:
+                first_answer_note = record['answers'][0]['meta']['note']
+            except (IndexError, KeyError):
+                first_answer_note = ''
+            # If that note includes a `pool` it's a dynamic record
+            if 'pool:' in first_answer_note:
+                return self._data_for_dynamic(_type, record)
+            # If not treat it as a simple record
+            try:
+                value = record['answers'][0]['answer'][0]
+            except (IndexError, KeyError):
+                value = None
+        else:
+            try:
+                value = record['short_answers'][0]
+            except IndexError:
+                value = None
 
-        try:
-            value = record['short_answers'][0]
-        except IndexError:
-            value = None
         return {
             'ttl': record['ttl'],
             'type': _type,
@@ -1419,41 +1430,14 @@ class Ns1Provider(BaseProvider):
                   for v in record.values]
         return {'answers': values, 'ttl': record.ttl}, None
 
-    def _get_ns1_filters(self, ns1_zone_name):
-        ns1_filters = {}
-        ns1_zone = {}
-
-        try:
-            ns1_zone = self._client.zones_retrieve(ns1_zone_name)
-        except ResourceException as e:
-            if e.message != self.ZONE_NOT_FOUND_MESSAGE:
-                raise
-
-        if 'records' in ns1_zone:
-            for ns1_record in ns1_zone['records']:
-                if ns1_record.get('tier', 1) > 1:
-                    # Need to get the full record data for geo records
-                    full_rec = self._client.records_retrieve(
-                        ns1_zone_name,
-                        ns1_record['domain'],
-                        ns1_record['type'])
-                    if 'filters' in full_rec:
-                        filter_key = f'{ns1_record["domain"]}.'
-                        ns1_filters[filter_key] = full_rec['filters']
-
-        return ns1_filters
-
-    def _disabled_flag_in_filters(self, filters, domain):
-        disabled_count = ['disabled' in f for f in filters].count(True)
-        if disabled_count and disabled_count != len(filters):
-            # Some filters have the disabled flag, and some don't. Disallow
-            exception_msg = f'Mixed disabled flag in filters for {domain}'
-            raise Ns1Exception(exception_msg)
-        return disabled_count == len(filters)
+    def _disabled_flag_in_filters(self, filters):
+        # fill up filters with disabled=False flag whenever absent
+        for f in filters:
+            f.setdefault('disabled', False)
+        return True
 
     def _extra_changes(self, desired, changes, **kwargs):
         self.log.debug('_extra_changes: desired=%s', desired.name)
-        ns1_filters = self._get_ns1_filters(desired.name[:-1])
         changed = set([c.record for c in changes])
         extra = []
         for record in desired.records:
@@ -1465,16 +1449,16 @@ class Ns1Provider(BaseProvider):
             # Check if filters for existing domains need an update
             # Needs an explicit check since there might be no change in the
             # config at all. Filters however might still need an update
-            domain = f'{record.name}.{record.zone.name}'
-            if domain in ns1_filters:
-                domain_filters = ns1_filters[domain]
-                if not self._disabled_flag_in_filters(domain_filters, domain):
-                    # 'disabled' entry absent in filter config. Need to update
-                    # filters. Update record
-                    self.log.info('_extra_changes: change in filters for %s',
-                                  domain)
-                    extra.append(Update(record, record))
-                    continue
+            domain = record.fqdn[:-1]
+            _type = record._type
+            record_filters = self.record_filters.get(domain, {}).get(_type, [])
+            if not self._valid_filter_config(record_filters):
+                # unrecognized set of filters, overwrite them by updating the
+                # record
+                self.log.info('_extra_changes: unrecognized filters in %s, '
+                              'will update record', domain)
+                extra.append(Update(record, record))
+                continue
 
             for value, have in self._monitors_for(record).items():
                 expected = self._monitor_gen(record, value)

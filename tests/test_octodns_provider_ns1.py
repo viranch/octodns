@@ -1610,15 +1610,6 @@ class TestNs1ProviderDynamic(TestCase):
     def test_data_for_dynamic(self):
         provider = Ns1Provider('test', 'api-key')
 
-        # Unexpected filters throws an error
-        ns1_record = {
-            'domain': 'unit.tests',
-            'filters': [],
-        }
-        with self.assertRaises(Ns1Exception) as ctx:
-            provider._data_for_dynamic('A', ns1_record)
-        self.assertEquals('Unrecognized advanced record', str(ctx.exception))
-
         # empty record turns into empty data
         ns1_record = {
             'answers': [],
@@ -2038,13 +2029,6 @@ class TestNs1ProviderDynamic(TestCase):
         extra = provider._extra_changes(desired, [])
         self.assertFalse(extra)
 
-        # Unexpected exception message
-        reset()
-        zones_retrieve_mock.side_effect = ResourceException('boom')
-        with self.assertRaises(ResourceException) as ctx:
-            extra = provider._extra_changes(desired, [])
-        self.assertEquals(zones_retrieve_mock.side_effect, ctx.exception)
-
         # Simple record, ignored, filter update lookups ignored
         reset()
         zones_retrieve_mock.side_effect = \
@@ -2093,6 +2077,9 @@ class TestNs1ProviderDynamic(TestCase):
         # untouched, but everything in sync so no change needed
         reset()
         # Generate what we expect to have
+        provider.record_filters[dynamic.fqdn[:-1]] = {
+            dynamic._type: provider._get_updated_filter_chain(False, False)
+        }
         gend = provider._monitor_gen(dynamic, '1.2.3.4')
         gend.update({
             'id': 'mid',  # need to add an id
@@ -2170,16 +2157,20 @@ class TestNs1ProviderDynamic(TestCase):
                 "zone": "unit.tests",
                 "type": "A",
                 "tier": 3,
-                "filters": Ns1Provider._BASIC_FILTER_CHAIN(provider, False)
+                "filters": provider._BASIC_FILTER_CHAIN(True)[:-1]
             }],
         }
         monitors_for_mock.side_effect = [{}]
         zones_retrieve_mock.side_effect = [ns1_zone]
         records_retrieve_mock.side_effect = ns1_zone['records']
+        ns1_record = ns1_zone['records'][0]
+        provider.record_filters[ns1_record['domain']] = {
+            ns1_record['type']: ns1_record['filters']
+        }
         extra = provider._extra_changes(desired, [])
         self.assertTrue(extra)
 
-        # Mixed disabled in filters. Raise Ns1Exception
+        # Mixed disabled in filters doesn't trigger an update
         reset()
         ns1_zone = {
             'records': [{
@@ -2194,9 +2185,12 @@ class TestNs1ProviderDynamic(TestCase):
         monitors_for_mock.side_effect = [{}]
         zones_retrieve_mock.side_effect = [ns1_zone]
         records_retrieve_mock.side_effect = ns1_zone['records']
-        with self.assertRaises(Ns1Exception) as ctx:
-            extra = provider._extra_changes(desired, [])
-        self.assertTrue('Mixed disabled flag in filters' in str(ctx.exception))
+        ns1_record = ns1_zone['records'][0]
+        provider.record_filters[ns1_record['domain']] = {
+            ns1_record['type']: ns1_record['filters']
+        }
+        extra = provider._extra_changes(desired, [])
+        self.assertFalse(extra)
 
     DESIRED = Zone('unit.tests.', [])
 
